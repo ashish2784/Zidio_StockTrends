@@ -1,151 +1,188 @@
-import streamlit as st
+```python
+import yfinance as yf
 import pandas as pd
-import math
-from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from prophet import Prophet
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+import streamlit as st
+from datetime import datetime
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# Set plot style
+sns.set(style='whitegrid')
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# Model Definitions (same as notebook)
+class LSTMModel(nn.Module):
+    def __init__(self, input_size=1, hidden_size=100, output_size=1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+    
+    def forward(self, x):
+        _, (h_n, _) = self.lstm(x)
+        return self.fc(h_n[-1])
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# Data Collection and Preprocessing
+@st.cache_data  # Cache data to avoid repeated downloads
+def load_data(ticker, start_date, end_date):
+    data = yf.download(ticker, start=start_date, end=end_date)
+    ts = data['Close'].dropna()
+    return ts
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# Model Training and Forecasting Functions
+def train_arima(ts, train_size):
+    train, test = ts[:train_size], ts[train_size:]
+    model = ARIMA(train, order=(5, 1, 0))
+    fit = model.fit()
+    forecast = fit.forecast(steps=len(test))
+    return forecast, mean_squared_error(test, forecast)
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+def train_sarima(ts, train_size):
+    train, test = ts[:train_size], ts[train_size:]
+    model = SARIMAX(train, order=(4, 1, 0), seasonal_order=(1, 1, 1, 5))
+    fit = model.fit()
+    forecast = fit.forecast(steps=len(test))
+    return forecast, mean_squared_error(test, forecast)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+def train_prophet(ts, train_size):
+    df = pd.DataFrame({'ds': ts.index, 'y': ts.values})
+    train, test = df.iloc[:train_size], df.iloc[train_size:]
+    model = Prophet()
+    model.fit(train)
+    future = model.make_future_dataframe(periods=len(test))
+    forecast = model.predict(future)
+    pred = forecast['yhat'].iloc[-len(test):]
+    return pred, mean_squared_error(test['y'], pred)
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+def train_lstm(ts, train_size, seq_length=5):
+    scaler = MinMaxScaler()
+    scaled_ts = scaler.fit_transform(ts.values.reshape(-1, 1))
+    
+    def create_sequences(data, seq_length):
+        xs, ys = [], []
+        for i in range(len(data) - seq_length):
+            x = data[i:i+seq_length]
+            y = data[i+seq_length]
+            xs.append(x)
+            ys.append(y)
+        return np.array(xs), np.array(ys)
+    
+    X, y = create_sequences(scaled_ts, seq_length)
+    train_X, test_X = X[:train_size-seq_length], X[train_size-seq_length:]
+    train_y, test_y = y[:train_size-seq_length], y[train_size-seq_length:]
+    
+    train_X = torch.tensor(train_X, dtype=torch.float32)
+    train_y = torch.tensor(train_y, dtype=torch.float32)
+    test_X = torch.tensor(test_X, dtype=torch.float32)
+    
+    model = LSTMModel()
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    for epoch in range(100):
+        model.train()
+        optimizer.zero_grad()
+        output = model(train_X)
+        loss = criterion(output, train_y)
+        loss.backward()
+        optimizer.step()
+    
+    lstm_predictions = []
+    current_seq = test_X[0].unsqueeze(0)
+    for _ in range(len(test_y)):
+        model.eval()
+        with torch.no_grad():
+            pred = model(current_seq)
+        lstm_predictions.append(pred.item())
+        current_seq = torch.cat((current_seq[:, 1:, :], pred.unsqueeze(0).unsqueeze(0)), dim=1)
+    
+    lstm_predictions = scaler.inverse_transform(np.array(lstm_predictions).reshape(-1, 1))
+    return lstm_predictions.flatten(), mean_squared_error(test_y.numpy(), lstm_predictions)
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+# Streamlit App
+st.title("Stock Market Forecasting Dashboard - ASIANPAINT.NS")
 
-    return gdp_df
+# Sidebar for inputs
+st.sidebar.header("Configure Parameters")
+ticker = st.sidebar.text_input("Ticker Symbol", "ASIANPAINT.NS")
+start_date = st.sidebar.date_input("Start Date", datetime(2000, 1, 1))
+end_date = st.sidebar.date_input("End Date", datetime.now())
+train_size = st.sidebar.slider("Train Size (% of data)", 50, 90, 80)
 
-gdp_df = get_gdp_data()
+# Load data
+ts = load_data(ticker, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+train_size = int(len(ts) * train_size / 100)
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+# Plot Original Data
+st.subheader("Historical Close Price")
+fig1, ax1 = plt.subplots(figsize=(12, 6))
+ax1.plot(ts, label='Close Price')
+ax1.set_title('Historical Close Price')
+ax1.set_xlabel('Date')
+ax1.set_ylabel('Price')
+ax1.legend()
+st.pyplot(fig1)
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+# Train and Display Forecasts
+if st.button("Generate Forecasts"):
+    st.subheader("Model Forecasts")
+    
+    # ARIMA
+    arima_forecast, arima_mse = train_arima(ts, train_size)
+    st.write(f"ARIMA MSE: {arima_mse}")
+    fig2, ax2 = plt.subplots(figsize=(12, 6))
+    ax2.plot(ts.index[:train_size], ts[:train_size], label='Train')
+    ax2.plot(ts.index[train_size:], ts[train_size:], label='Test')
+    ax2.plot(ts.index[train_size:], arima_forecast, label='ARIMA Forecast')
+    ax2.legend()
+    st.pyplot(fig2)
+    
+    # SARIMA
+    sarima_forecast, sarima_mse = train_sarima(ts, train_size)
+    st.write(f"SARIMA MSE: {sarima_mse}")
+    fig3, ax3 = plt.subplots(figsize=(12, 6))
+    ax3.plot(ts.index[:train_size], ts[:train_size], label='Train')
+    ax3.plot(ts.index[train_size:], ts[train_size:], label='Test')
+    ax3.plot(ts.index[train_size:], sarima_forecast, label='SARIMA Forecast')
+    ax3.legend()
+    st.pyplot(fig3)
+    
+    # Prophet
+    prophet_forecast, prophet_mse = train_prophet(ts, train_size)
+    st.write(f"Prophet MSE: {prophet_mse}")
+    fig4, ax4 = plt.subplots(figsize=(12, 6))
+    ax4.plot(ts.index[:train_size], ts[:train_size], label='Train')
+    ax4.plot(ts.index[train_size:], ts[train_size:], label='Test')
+    ax4.plot(ts.index[train_size:], prophet_forecast, label='Prophet Forecast')
+    ax4.legend()
+    st.pyplot(fig4)
+    
+    # LSTM
+    lstm_forecast, lstm_mse = train_lstm(ts, train_size)
+    st.write(f"LSTM MSE: {lstm_mse}")
+    fig5, ax5 = plt.subplots(figsize=(12, 6))
+    ax5.plot(ts.index[train_size+5:], ts[train_size+5:], label='Test')
+    ax5.plot(ts.index[train_size+5:train_size+5+len(lstm_forecast)], lstm_forecast, label='LSTM Forecast')
+    ax5.legend()
+    st.pyplot(fig5)
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+    # Model Comparison
+    st.subheader("Model Comparison")
+    comparison = pd.DataFrame({
+        'Model': ['ARIMA', 'SARIMA', 'Prophet', 'LSTM'],
+        'MSE': [arima_mse, sarima_mse, prophet_mse, lstm_mse]
+    })
+    st.table(comparison)
+    st.write(f"Best Model: {comparison.loc[comparison['MSE'].idxmin()]['Model']} with MSE: {comparison['MSE'].min()}")
 
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+# Run the app
+if __name__ == "__main__":
+    st.sidebar.write("Last Updated: 02:48 PM IST, September 30, 2025")
+```
