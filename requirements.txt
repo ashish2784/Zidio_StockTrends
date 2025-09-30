@@ -1,2 +1,10 @@
+yfinance
+prophet
 streamlit
 pandas
+numpy
+matplotlib
+seaborn
+statsmodels
+torch
+scikit-learn
